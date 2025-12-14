@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from datasets import load_dataset
 
 # ================= 配置区域 =================
-MODEL_PATH = "./models/pythia-70m"
+MODEL_PATH = "./models/pythia-2.8b"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LENGTH = 2048  # Pythia 的最大上下文窗口
 # ===========================================

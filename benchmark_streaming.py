@@ -17,7 +17,7 @@ from datasets import load_dataset
 from pythia_press import PythiaStreamingLLMPress
 
 # ================= 配置区域 =================
-MODEL_PATH = "./models/pythia-70m"
+MODEL_PATH = "./models/pythia-2.8b"  
 # MODEL_PATH = "EleutherAI/pythia-70m" # 如果本地没有，可以用这个在线拉取
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LENGTH = 2048

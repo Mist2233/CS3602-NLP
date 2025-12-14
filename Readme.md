@@ -1,6 +1,6 @@
 # NLP Final Lab - StreamingLLM Implementation
 
-基于 Pythia-70m 模型的 StreamingLLM KV Cache 优化实验
+基于 Pythia-2.8b 模型的 StreamingLLM KV Cache 优化实验
 
 ## 📋 目录
 
@@ -18,9 +18,10 @@
 
 本项目实现了 **StreamingLLM** 算法，通过智能压缩 KV Cache 来优化大语言模型的推理性能。主要特点：
 
-- ✅ **质量无损**: PPL 保持不变 (37.86 → 37.86)
-- ✅ **内存优化**: 显存占用降低 11.6% (176.91 MB → 156.41 MB)
-- ✅ **首 Token 加速**: TTFT 降低 60.2% (98.4ms → 39.2ms)
+- ✅ **质量无损**: PPL 保持不变 (9.79 → 9.79)
+- ✅ **内存优化**: 显存占用降低 10.0% (6100 MB → 5493 MB)
+- ✅ **性能提升**: 吞吐量提升 33.9% (24.40 → 32.68 tokens/s)
+- ✅ **延迟降低**: TTFT 降低 45.9%, TPOT 降低 25.2%
 - ✅ **完整实现**: 使用 Pre-Forward Hook 正确拦截和修改 DynamicCache
 
 **核心思想**: 保留开头的 Attention Sinks (n_sink tokens) 和末尾的最近 tokens，丢弃中间的过时 tokens。
@@ -77,8 +78,10 @@ python download_model.py
 ```
 
 下载内容：
-- **模型**: Pythia-70m (EleutherAI/pythia-70m)
-- **保存位置**: `./models/pythia-70m/`
+- **模型**: Pythia-2.8b (EleutherAI/pythia-2.8b)
+- **保存位置**: `./models/pythia-2.8b/`
+- **模型大小**: ~10 GB
+- **预计下载时间**: 20-40 分钟（取决于网速）
 
 ### 方法二：手动配置
 
@@ -100,7 +103,7 @@ python download_model.py
 
 | 文件                     | 说明                  | 用途                                         |
 | ------------------------ | --------------------- | -------------------------------------------- |
-| `download_model.py`      | 模型下载脚本          | 从 HuggingFace 下载 Pythia-70m               |
+| `download_model.py`      | 模型下载脚本          | 从 HuggingFace 下载 Pythia-2.8b              |
 | `baseline.py`            | 基准测试脚本          | 测试原始模型的 PPL、Memory、FLOPs 等指标     |
 | `benchmark_streaming.py` | StreamingLLM 对比测试 | 对比 Baseline 和 StreamingLLM 的全部性能指标 |
 | `pythia_press.py`        | StreamingLLM 核心实现 | KV Cache 压缩器，使用 Pre-Forward Hook       |
@@ -121,7 +124,7 @@ python download_model.py
 ```
 NLP-FinalLab/
 ├── models/                    # 模型文件
-│   └── pythia-70m/
+│   └── pythia-2.8b/
 │       ├── config.json
 │       ├── model.safetensors
 │       └── tokenizer.json
@@ -146,7 +149,8 @@ conda activate nlp
 python download_model.py
 ```
 
-预计下载时间：3-5 分钟（取决于网速）
+预计下载时间：20-40 分钟（取决于网速）
+模型大小：约 10 GB
 
 ### 2. 基准测试（Baseline）
 
@@ -162,7 +166,7 @@ python baseline.py
 - **FLOPs**: 模型计算量
 - **Speed**: 吞吐量、TTFT、TPOT
 
-预计运行时间：5-10 分钟
+预计运行时间：10-15 分钟
 
 ### 3. StreamingLLM 对比测试（核心实验）
 
@@ -179,11 +183,11 @@ python benchmark_streaming.py
 ```
 指标              | Baseline     | StreamingLLM | 变化
 -------------------------------------------------------
-PPL              | 37.86        | 37.86        | +0.0%
-Memory (MB)      | 176.91       | 156.41       | -11.6%
-Throughput (t/s) | 164.66       | 150.59       | -8.5%
-TTFT (s)         | 0.09841      | 0.03916      | -60.2%
-TPOT (ms)        | 6.03         | 6.62         | +9.9%
+PPL              | 9.79         | 9.79         | +0.0%
+Memory (MB)      | 6100.46      | 5493.35      | -10.0%
+Throughput (t/s) | 24.40        | 32.68        | +33.9%
+TTFT (s)         | 0.3185       | 0.1724       | -45.9%
+TPOT (ms)        | 40.84        | 30.53        | -25.2%
 ```
 
 ### 4. 快速测试生成效果
@@ -213,20 +217,21 @@ python debug_press.py
 
 ### 最终性能对比
 
-| 指标               | Baseline   | StreamingLLM | 变化         | 说明          |
-| ------------------ | ---------- | ------------ | ------------ | ------------- |
-| **PPL** (↓)        | 37.86      | 37.86        | **+0.0%** ✅  | 质量无损      |
-| **Memory** (↓)     | 176.91 MB  | 156.41 MB    | **-11.6%** ✅ | 显存优化      |
-| **TTFT** (↓)       | 98.4 ms    | 39.2 ms      | **-60.2%** ✅ | 首 Token 加速 |
-| **Throughput** (↑) | 164.66 t/s | 150.59 t/s   | -8.5%        | 合理代价      |
-| **TPOT** (↓)       | 6.03 ms    | 6.62 ms      | +9.9%        | 合理代价      |
+| 指标               | Baseline   | StreamingLLM | 变化          | 说明              |
+| ------------------ | ---------- | ------------ | ------------- | ----------------- |
+| **PPL** (↓)        | 9.79       | 9.79         | **+0.0%** ✅   | 质量无损          |
+| **Memory** (↓)     | 6100.46 MB | 5493.35 MB   | **-10.0%** ✅  | 显存节省 607 MB   |
+| **Throughput** (↑) | 24.40 t/s  | 32.68 t/s    | **+33.9%** ✅✅ | 吞吐量大幅提升    |
+| **TTFT** (↓)       | 318.5 ms   | 172.4 ms     | **-45.9%** ✅  | 首 Token 加速     |
+| **TPOT** (↓)       | 40.84 ms   | 30.53 ms     | **-25.2%** ✅  | 每 Token 延迟降低 |
 
 ### 关键发现
 
-1. **质量保证**: PPL 保持完全一致，证明 Attention Sinks 策略有效
-2. **内存优化**: 在小模型上节省 11.6%，大模型效果会更显著
-3. **延迟优化**: TTFT 降低 60%，用户感知明显改善
-4. **合理权衡**: 吞吐量略降，但换来更低内存和延迟
+1. **质量保证**: PPL 保持完全一致 (9.79)，证明 Attention Sinks 策略有效
+2. **内存优化**: 显存节省 607 MB (-10.0%)，对长序列效果更显著
+3. **性能提升**: 吞吐量提升 33.9%，压缩反而加速了推理！
+4. **延迟优化**: TTFT 降低 45.9%，TPOT 降低 25.2%，用户体验大幅改善
+5. **全面胜出**: 相比小模型，2.8B 展现出 StreamingLLM 的真正优势
 
 ### StreamingLLM 参数说明
 
@@ -244,9 +249,10 @@ press = PythiaStreamingLLMPress(
 ### 计算量分析
 
 ```
-Model FLOPs: 1.45 GFLOPs
-MACs: 0.72 GMACs
-Params: 70.43 M
+Model: Pythia-2.8b
+Params: 2.78 B (约为 70M 的 40 倍)
+Memory: ~5.5 GB (FP16)
+Layers: 32 个 Transformer 层
 ```
 
 ---
@@ -305,16 +311,16 @@ load_dataset("pg19", split="train", streaming=True, trust_remote_code=False)
 
 **问题**: GPU 显存不够运行模型
 
+**最低要求**: Pythia-2.8b 需要至少 **6 GB** 显存（推荐 8 GB+）
+
 **解决方案**:
-1. 减少测试序列长度（修改 `MAX_LENGTH`）
-2. 使用更激进的压缩参数：
+1. 使用 StreamingLLM 压缩（可节省约 600 MB）
+2. 减少测试序列长度（修改 `MAX_LENGTH`）
+3. 使用更激进的压缩参数：
    ```python
    press = PythiaStreamingLLMPress(compression_ratio=0.8, n_sink=2)
    ```
-3. 使用 CPU 模式（慢但不需要 GPU）：
-   ```python
-   DEVICE = "cpu"
-   ```
+4. 如果显存 < 6 GB，考虑使用 Pythia-1b 或 Pythia-410m
 
 ### Q5: StreamingLLM 没有压缩效果
 
@@ -340,11 +346,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 加载模型
 model = AutoModelForCausalLM.from_pretrained(
-    'models/pythia-70m',
+    'models/pythia-2.8b',
     torch_dtype=torch.float16,
     device_map='cuda'
 )
-tokenizer = AutoTokenizer.from_pretrained('models/pythia-70m')
+tokenizer = AutoTokenizer.from_pretrained('models/pythia-2.8b')
 
 # 注册 StreamingLLM
 press = PythiaStreamingLLMPress(compression_ratio=0.7, n_sink=4)
