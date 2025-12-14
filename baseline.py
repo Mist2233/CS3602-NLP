@@ -17,12 +17,10 @@ from datasets import load_dataset
 # ================= 配置区域 =================
 MODEL_PATH = "./models/pythia-70m"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-print(f"检测到的设备: {DEVICE}")
-
 MAX_LENGTH = 2048  # Pythia 的最大上下文窗口
 # ===========================================
 
+print(f"检测到的设备: {DEVICE}")
 print(f"正在加载模型: {MODEL_PATH} 到 {DEVICE}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 model = AutoModelForCausalLM.from_pretrained(
