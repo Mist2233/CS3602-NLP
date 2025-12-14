@@ -61,7 +61,7 @@ pip install tqdm
 - Python: 3.10+
 - PyTorch: 2.0+
 - Transformers: 4.35+
-- datasets: 2.x (注意：3.x 版本可能导致 PG-19 数据集加载失败)
+- datasets: 2.x (注意：3.x 及以上的版本可能导致 PG-19 数据集加载失败)
 - CUDA: 11.8 或 12.1
 
 ---
@@ -80,8 +80,8 @@ python download_model.py
 下载内容：
 - **模型**: Pythia-2.8b (EleutherAI/pythia-2.8b)
 - **保存位置**: `./models/pythia-2.8b/`
-- **模型大小**: ~10 GB
-- **预计下载时间**: 20-40 分钟（取决于网速）
+- **模型大小**: ~5 GB
+- **预计下载时间**: 5-20 分钟（取决于网速）
 
 ### 方法二：手动配置
 
@@ -113,7 +113,7 @@ python download_model.py
 
 | 文件                     | 说明                 |
 | ------------------------ | -------------------- |
-| `debug_press.py`         | 详细调试工具（可选） | 验证压缩逻辑，对比三种模式 |
+| `debug_press.py`         | 详细调试工具（已归档） | 验证压缩逻辑，对比三种模式 |
 | `streaming_llm_press.py` | 旧版实现（已废弃）   | 历史版本，不推荐使用       |
 | `FIX_SUMMARY.md`         | 修复总结文档         | 详细记录调试过程和解决方案 |
 | `worklog.md`             | 工作日志             | 开发过程记录               |
@@ -131,6 +131,7 @@ NLP-FinalLab/
 ├── hf_cache/                  # HuggingFace 缓存
 │   ├── datasets/              # 数据集缓存
 │   └── hub/                   # 模型缓存
+│   └── modules/               # 功能模组
 ├── baseline.py                # 基准测试
 ├── benchmark_streaming.py     # StreamingLLM 对比
 ├── pythia_press.py           # 核心实现
@@ -152,7 +153,15 @@ python download_model.py
 预计下载时间：20-40 分钟（取决于网速）
 模型大小：约 10 GB
 
-### 2. 基准测试（Baseline）
+### 2. 快速测试生成效果
+
+```bash
+python run_pythia.py
+```
+
+这会快速生成一段文本，验证模型加载正确。
+
+### 3. 基准测试（Baseline）
 
 测试原始模型性能：
 
@@ -166,9 +175,9 @@ python baseline.py
 - **FLOPs**: 模型计算量
 - **Speed**: 吞吐量、TTFT、TPOT
 
-预计运行时间：10-15 分钟
+预计运行时间：~5 分钟
 
-### 3. StreamingLLM 对比测试（核心实验）
+### 4. StreamingLLM 对比测试（核心实验）
 
 ```bash
 python benchmark_streaming.py
@@ -190,13 +199,6 @@ TTFT (s)         | 0.3185       | 0.1724       | -45.9%
 TPOT (ms)        | 40.84        | 30.53        | -25.2%
 ```
 
-### 4. 快速测试生成效果
-
-```bash
-python run_pythia.py
-```
-
-这会快速生成一段文本，验证模型加载正确。
 
 ### 5. 调试工具（可选）
 
@@ -261,9 +263,11 @@ Layers: 32 个 Transformer 层
 
 ### Q1: 安装 PyTorch 时遇到 CUDA 版本不匹配
 
-**问题**: `RuntimeError: CUDA out of memory` 或 CUDA 版本错误
+**问题**: CUDA 版本错误
 
 **解决方案**:
+可以参考：[菜鸟教程](https://www.runoob.com/pytorch/pytorch-install.html)安装合适版本的PyTorch。
+
 ```bash
 # 检查 CUDA 版本
 nvidia-smi
@@ -295,7 +299,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 **问题**: `RuntimeError: Dataset scripts are no longer supported`
 
-**原因**: datasets 库版本过高（3.x）
+**原因**: datasets 库版本过高（3.x or 4.x）
 
 **解决方案**:
 ```bash
@@ -412,7 +416,7 @@ press = PythiaStreamingLLMPress(
 
 如有问题，请提交 Issue 或联系项目维护者。
 
-**最后更新**: 2024-12-14
+**最后更新**: 2025-12-14
 
 
 
