@@ -23,3 +23,7 @@ RuntimeError: Dataset scripts are no longer supported, but found pg19.py
 
 可以参考 https://github.com/huggingface/datasets/issues/7693#issuecomment-3103380232
 
+呃，装了kvpress这个库之后，datasets被自动回退到2.21.0版本了，所以上面的说明不是特别重要。
+
+
+
