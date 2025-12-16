@@ -12,8 +12,6 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Patching for GPTNeoX Support ---
-
 # 1. Alias 'model' to 'gpt_neox' for BasePress compatibility
 if not hasattr(GPTNeoXForCausalLM, "model"):
     GPTNeoXForCausalLM.model = property(lambda self: self.gpt_neox)
@@ -106,10 +104,14 @@ def patched_get_prerope_query_states(module, hidden_states):
         qkv = module.query_key_value(hidden_states)
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
-        # Q is the first part
-        query_states = qkv[..., : num_heads * head_dim]
-        bsz, q_len, _ = hidden_states.shape
-        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        
+        # New correct split logic
+        new_qkv_shape = qkv.size()[:-1] + (num_heads, 3 * head_dim)
+        qkv = qkv.view(*new_qkv_shape)
+        query_states = qkv[..., : head_dim]
+        
+        # Permute to [bsz, num_heads, seq_len, head_dim]
+        query_states = query_states.permute(0, 2, 1, 3)
         return query_states
     return original_get_q(module, hidden_states)
 
@@ -118,12 +120,14 @@ def patched_get_prerope_key_states(module, hidden_states):
         qkv = module.query_key_value(hidden_states)
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
-        # K is the second part
-        start = num_heads * head_dim
-        end = start + num_heads * head_dim
-        key_states = qkv[..., start : end]
-        bsz, k_len, _ = hidden_states.shape
-        key_states = key_states.view(bsz, k_len, num_heads, head_dim).transpose(1, 2)
+        
+        # New correct split logic
+        new_qkv_shape = qkv.size()[:-1] + (num_heads, 3 * head_dim)
+        qkv = qkv.view(*new_qkv_shape)
+        key_states = qkv[..., head_dim : 2 * head_dim]
+        
+        # Permute to [bsz, num_heads, seq_len, head_dim]
+        key_states = key_states.permute(0, 2, 1, 3)
         return key_states
     return original_get_k(module, hidden_states)
 
@@ -193,33 +197,39 @@ SnapKVPress.compute_window_attention = staticmethod(patched_compute_window_atten
 # 6. Add GPTNeoX to supported models
 kvpress.presses.base_press.SUPPORTED_MODELS = kvpress.presses.base_press.SUPPORTED_MODELS + (GPTNeoXForCausalLM,)
 
-def verify():
+def verify_gpt_neox_patches():
     model_id = "EleutherAI/pythia-70m"
     logger.info(f"Loading {model_id} for verification...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id)
     
-    input_text = "This is a test " * 50
-    inputs = tokenizer(input_text, return_tensors="pt")
+    # 6. Patch 'layer_idx' for GPTNeoXLayer (needed for PyramidKV)
+    for i, layer in enumerate(model.gpt_neox.layers):
+        layer.layer_idx = i
+
+    # Instantiate presses
+    from kvpress import SnapKVPress, StreamingLLMPress, PyramidKVPress
     
-    press = SnapKVPress(compression_ratio=0.5)
-    logger.info("Running generation with SnapKVPress...")
+    presses = {
+        "SnapKV": SnapKVPress(compression_ratio=0.5),
+        "StreamingLLM": StreamingLLMPress(compression_ratio=0.5),
+        "PyramidKV": PyramidKVPress(compression_ratio=0.5)
+    }
+
+    input_text = "Hello, I am testing the KV Press implementation for Pythia models." * 20
+    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
     
-    # Enable cache for generation
-    model.config.use_cache = True
-    
-    try:
-        with press(model):
-            outputs = model.generate(**inputs, max_new_tokens=10, use_cache=True)
-            
-        logger.info("Generation successful!")
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print("Generated text sample:", decoded[:100])
-        print("Verification Passed.")
-    except Exception as e:
-        logger.error(f"Verification failed: {e}")
-        import traceback
-        traceback.print_exc()
+    for name, press in presses.items():
+        print(f"\nTesting {name}...")
+        try:
+            with press(model):
+                output = model.generate(**inputs, max_new_tokens=20, use_cache=True)
+            print(f"{name} Output: {tokenizer.decode(output[0])[:100]}...")
+            print(f"{name} Test Passed!")
+        except Exception as e:
+            print(f"{name} Test Failed!")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
-    verify()
+    verify_gpt_neox_patches()

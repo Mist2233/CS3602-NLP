@@ -4,9 +4,10 @@ from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXForCausalLM, G
 from transformers.models.gpt_neox.configuration_gpt_neox import GPTNeoXConfig
 from transformers.models.llama.modeling_llama import repeat_kv, rotate_half
 import kvpress
-from kvpress import SnapKVPress
+from kvpress import SnapKVPress, StreamingLLMPress, PyramidKVPress
 from kvpress.presses.base_press import BasePress
 import kvpress.utils
+from streaming_llm_standalone import StreamingLLM
 import time
 import logging
 import datasets
@@ -111,10 +112,14 @@ def patched_get_prerope_query_states(module, hidden_states):
         qkv = module.query_key_value(hidden_states)
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
-        # Q is the first part
-        query_states = qkv[..., : num_heads * head_dim]
-        bsz, q_len, _ = hidden_states.shape
-        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        
+        # New correct split logic (Matches Hugging Face Internal Logic)
+        new_qkv_shape = qkv.size()[:-1] + (num_heads, 3 * head_dim)
+        qkv = qkv.view(*new_qkv_shape)
+        query_states = qkv[..., : head_dim]
+        
+        # Permute to [bsz, num_heads, seq_len, head_dim]
+        query_states = query_states.permute(0, 2, 1, 3)
         return query_states
     return original_get_q(module, hidden_states)
 
@@ -123,12 +128,14 @@ def patched_get_prerope_key_states(module, hidden_states):
         qkv = module.query_key_value(hidden_states)
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
-        # K is the second part
-        start = num_heads * head_dim
-        end = start + num_heads * head_dim
-        key_states = qkv[..., start : end]
-        bsz, k_len, _ = hidden_states.shape
-        key_states = key_states.view(bsz, k_len, num_heads, head_dim).transpose(1, 2)
+        
+        # New correct split logic (Matches Hugging Face Internal Logic)
+        new_qkv_shape = qkv.size()[:-1] + (num_heads, 3 * head_dim)
+        qkv = qkv.view(*new_qkv_shape)
+        key_states = qkv[..., head_dim : 2 * head_dim]
+        
+        # Permute to [bsz, num_heads, seq_len, head_dim]
+        key_states = key_states.permute(0, 2, 1, 3)
         return key_states
     return original_get_k(module, hidden_states)
 
@@ -212,13 +219,13 @@ def evaluate_ppl(model, tokenizer, dataset_name="wikitext", split="test", limit_
              # We will try to load 'deepmind/pg19' but it might require manual download.
              # Alternative: use a local file or skipping if not available.
              try:
-                 data = datasets.load_dataset("pg19", split=split, streaming=True)
+                 data = datasets.load_dataset("pg19", split=split, streaming=True, trust_remote_code=True)
                  # Take first book
                  text = next(iter(data))["text"]
                  # Limit text length
                  text = text[:100000] 
-             except:
-                 logger.warning("Could not load pg19. Skipping.")
+             except Exception as e:
+                 logger.warning(f"Could not load pg19: {e}. Skipping.")
                  return float('inf')
         else:
             text = "This is a dummy text. " * 500
@@ -274,13 +281,79 @@ def evaluate_ppl(model, tokenizer, dataset_name="wikitext", split="test", limit_
     logger.info(f"PPL Result ({dataset_name}): {ppl.item()}")
     return ppl.item()
 
+
+def evaluate_ppl_streaming(
+    model,
+    tokenizer,
+    dataset_name: str = "wikitext",
+    split: str = "test",
+    limit_samples: int = 1,
+    n_sink: int = 4,
+    window_size: int = 256,
+):
+    logger.info(
+        f"Evaluating PPL (StreamingLLM standalone) on {dataset_name} ({split}), "
+        f"n_sink={n_sink}, window_size={window_size}"
+    )
+
+    try:
+        if dataset_name == "wikitext":
+            data = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+            text = "\n\n".join(data["text"][:limit_samples])
+        elif dataset_name == "pg19":
+            try:
+                data = datasets.load_dataset("pg19", split=split, streaming=True, trust_remote_code=True)
+                text = next(iter(data))["text"]
+                text = text[:100000]
+            except Exception as e:
+                logger.warning(f"Could not load pg19: {e}. Skipping.")
+                return float("inf")
+        else:
+            text = "This is a dummy text. " * 500
+    except Exception as e:
+        logger.warning(f"Failed to load dataset {dataset_name}: {e}. Using dummy text.")
+        text = "This is a dummy text for testing purposes. " * 1000
+
+    encodings = tokenizer(text, return_tensors="pt")
+
+    max_tokens = 2000
+    if encodings.input_ids.size(1) > max_tokens:
+        encodings.input_ids = encodings.input_ids[:, :max_tokens]
+
+    input_ids = encodings.input_ids.to(model.device)
+    seq_len = input_ids.size(1)
+
+    if seq_len < 2:
+        logger.warning("Input too short for PPL evaluation")
+        return float("inf")
+
+    streamer = StreamingLLM(n_sink=n_sink, window_size=window_size)
+    losses = []
+
+    for pos in range(1, seq_len):
+        prefix = input_ids[:, :pos]
+        ctx_ids = streamer.build_context(prefix)
+        labels = torch.full_like(ctx_ids, -100)
+        labels[:, -1] = input_ids[:, pos]
+
+        with torch.no_grad():
+            outputs = model(ctx_ids, labels=labels)
+            losses.append(outputs.loss)
+
+    ppl = torch.exp(torch.stack(losses).mean())
+    logger.info(f"PPL Result (StreamingLLM standalone, {dataset_name}): {ppl.item()}")
+    return ppl.item()
+
 def benchmark_speed(model, tokenizer, press=None, num_tokens=50, batch_size=1):
     logger.info(f"Benchmarking speed (Generation) with Batch Size {batch_size}...")
     
     # Create input text
-    # Max pos is 2048. We want to be close to it but leave room for generation.
-    # Target: ~1800 context tokens.
-    input_text = "The history of natural language processing is " * 280 # ~1900 tokens?
+    # Prefer the custom long-form dataset if available, fall back to synthetic text.
+    try:
+        with open("custom_complex_dataset.txt", "r", encoding="utf-8") as f:
+            input_text = f.read()
+    except Exception:
+        input_text = "The history of natural language processing is " * 280
     
     # Tokenize once
     single_input = tokenizer(input_text, return_tensors="pt")
@@ -328,6 +401,51 @@ def benchmark_speed(model, tokenizer, press=None, num_tokens=50, batch_size=1):
     logger.info(f"Time taken: {duration:.4f}s ({tokens_per_sec:.2f} tok/s)")
     return tokens_per_sec
 
+
+def benchmark_speed_streaming(
+    model,
+    tokenizer,
+    n_sink: int = 4,
+    window_size: int = 256,
+    num_tokens: int = 50,
+    batch_size: int = 1,
+):
+    logger.info(
+        f"Benchmarking speed (StreamingLLM standalone) with Batch Size {batch_size}, "
+        f"n_sink={n_sink}, window_size={window_size}"
+    )
+
+    try:
+        with open("custom_complex_dataset.txt", "r", encoding="utf-8") as f:
+            input_text = f.read()
+    except Exception:
+        input_text = "The history of natural language processing is " * 280
+
+    single_input = tokenizer(input_text, return_tensors="pt")
+    input_ids = single_input.input_ids
+
+    max_context = 1800
+    if input_ids.shape[1] > max_context:
+        input_ids = input_ids[:, :max_context]
+
+    seq_len = input_ids.shape[1]
+    logger.info(f"[Streaming] Input sequence length: {seq_len}")
+
+    input_ids = input_ids.repeat(batch_size, 1).to(model.device)
+
+    streamer = StreamingLLM(n_sink=n_sink, window_size=window_size)
+
+    print(f"Generating {num_tokens} tokens with StreamingLLM (BS={batch_size})...")
+    start_time = time.time()
+    streamer.generate(model, input_ids, max_new_tokens=num_tokens)
+    end_time = time.time()
+
+    duration = end_time - start_time
+    total_tokens = num_tokens * batch_size
+    tokens_per_sec = total_tokens / duration
+    logger.info(f"[Streaming] Time taken: {duration:.4f}s ({tokens_per_sec:.2f} tok/s)")
+    return tokens_per_sec
+
 if __name__ == "__main__":
     model_id = "EleutherAI/pythia-2.8b"
     # model_id = "EleutherAI/pythia-70m" # Uncomment for debugging
@@ -346,36 +464,126 @@ if __name__ == "__main__":
         logger.error(f"Failed to load model: {e}")
         exit(1)
 
+    # Patch 'layer_idx' for GPTNeoXLayer (needed for PyramidKV)
+    for i, layer in enumerate(model.gpt_neox.layers):
+        layer.layer_idx = i
+
     results = {}
 
-    # 1. Baseline
-    print("\n=== Baseline (No Press) ===")
+    print("\n=== Baseline (No Compression) ===")
     speed_base_bs1 = benchmark_speed(model, tokenizer, press=None, num_tokens=30, batch_size=1)
-    # speed_base_bs4 = benchmark_speed(model, tokenizer, press=None, num_tokens=30, batch_size=4) # Commented out to save time for default run
+    speed_base_bs4 = benchmark_speed(model, tokenizer, press=None, num_tokens=30, batch_size=4)
     ppl_base_wiki = evaluate_ppl(model, tokenizer, dataset_name="wikitext", limit_samples=5, press=None)
     ppl_base_pg19 = evaluate_ppl(model, tokenizer, dataset_name="pg19", press=None)
-    
-    results['Baseline (BS=1)'] = {'speed': speed_base_bs1, 'ppl_wiki': ppl_base_wiki, 'ppl_pg19': ppl_base_pg19}
 
-    # 2. SnapKVPress (Compression 0.5)
-    print("\n=== SnapKVPress (ratio=0.5) ===")
+    results['Baseline (BS=1)'] = {'speed': speed_base_bs1, 'ppl_wiki': ppl_base_wiki, 'ppl_pg19': ppl_base_pg19}
+    results['Baseline (BS=4)'] = {'speed': speed_base_bs4, 'ppl_wiki': None, 'ppl_pg19': None}
+
+    print("\n=== StreamingLLM Standalone (n_sink=4, window=256) ===")
     try:
-        press_snap = SnapKVPress(compression_ratio=0.5)
-        speed_snap_bs1 = benchmark_speed(model, tokenizer, press=press_snap, num_tokens=30, batch_size=1)
-        # speed_snap_bs4 = benchmark_speed(model, tokenizer, press=press_snap, num_tokens=30, batch_size=4)
-        ppl_snap_wiki = evaluate_ppl(model, tokenizer, dataset_name="wikitext", limit_samples=5, press=press_snap)
-        ppl_snap_pg19 = evaluate_ppl(model, tokenizer, dataset_name="pg19", press=press_snap)
-        
-        results['SnapKV (BS=1)'] = {'speed': speed_snap_bs1, 'ppl_wiki': ppl_snap_wiki, 'ppl_pg19': ppl_snap_pg19}
-        
+        stream_n_sink = 4
+        stream_window = 256
+        speed_stream_standalone_bs1 = benchmark_speed_streaming(
+            model,
+            tokenizer,
+            n_sink=stream_n_sink,
+            window_size=stream_window,
+            num_tokens=30,
+            batch_size=1,
+        )
+        speed_stream_standalone_bs4 = benchmark_speed_streaming(
+            model,
+            tokenizer,
+            n_sink=stream_n_sink,
+            window_size=stream_window,
+            num_tokens=30,
+            batch_size=4,
+        )
+        ppl_stream_standalone_wiki = evaluate_ppl_streaming(
+            model,
+            tokenizer,
+            dataset_name="wikitext",
+            limit_samples=1,
+            n_sink=stream_n_sink,
+            window_size=stream_window,
+        )
+        ppl_stream_standalone_pg19 = evaluate_ppl_streaming(
+            model,
+            tokenizer,
+            dataset_name="pg19",
+            limit_samples=1,
+            n_sink=stream_n_sink,
+            window_size=stream_window,
+        )
+
+        results['StreamingLLM-Standalone (BS=1)'] = {
+            'speed': speed_stream_standalone_bs1,
+            'ppl_wiki': ppl_stream_standalone_wiki,
+            'ppl_pg19': ppl_stream_standalone_pg19,
+        }
+        results['StreamingLLM-Standalone (BS=4)'] = {
+            'speed': speed_stream_standalone_bs4,
+            'ppl_wiki': None,
+            'ppl_pg19': None,
+        }
     except Exception as e:
-        logger.error(f"SnapKV Failed: {e}")
+        logger.error(f"StreamingLLM standalone Failed: {e}")
         import traceback
         traceback.print_exc()
 
-    print("\n" + "="*60)
-    print(f"{'Method':<20} | {'Speed (tok/s)':<15} | {'PPL (Wiki)':<12} | {'PPL (PG19)':<12}")
-    print("-" * 70)
-    for method, res in results.items():
-        print(f"{method:<20} | {res['speed']:<15.2f} | {res.get('ppl_wiki', 'N/A'):<12.2f} | {res.get('ppl_pg19', 'N/A'):<12.2f}")
-    print("="*60)
+    # # 2. SnapKVPress (Compression 0.5)
+    # print("\n=== SnapKVPress (ratio=0.5) ===")
+    # try:
+    #     press_snap = SnapKVPress(compression_ratio=0.1)
+    #     speed_snap_bs1 = benchmark_speed(model, tokenizer, press=press_snap, num_tokens=30, batch_size=1)
+    #     speed_snap_bs4 = benchmark_speed(model, tokenizer, press=press_snap, num_tokens=30, batch_size=4)
+    #     ppl_snap_wiki = evaluate_ppl(model, tokenizer, dataset_name="wikitext", limit_samples=20, press=press_snap)
+    #     ppl_snap_pg19 = evaluate_ppl(model, tokenizer, dataset_name="pg19", press=press_snap)
+        
+    #     results['SnapKV (BS=1)'] = {'speed': speed_snap_bs1, 'ppl_wiki': ppl_snap_wiki, 'ppl_pg19': ppl_snap_pg19}
+    #     results['SnapKV (BS=4)'] = {'speed': speed_snap_bs4, 'ppl_wiki': None, 'ppl_pg19': None}
+    # except Exception as e:
+    #     logger.error(f"SnapKV Failed: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+
+    # # 3. StreamingLLMPress (Compression 0.5)
+    # print("\n=== StreamingLLMPress (ratio=0.5) ===")
+    # try:
+    #     press_stream = StreamingLLMPress(compression_ratio=0.1)
+    #     speed_stream_bs1 = benchmark_speed(model, tokenizer, press=press_stream, num_tokens=30, batch_size=1)
+    #     speed_stream_bs4 = benchmark_speed(model, tokenizer, press=press_stream, num_tokens=30, batch_size=4)
+    #     ppl_stream_wiki = evaluate_ppl(model, tokenizer, dataset_name="wikitext", limit_samples=20, press=press_stream)
+    #     ppl_stream_pg19 = evaluate_ppl(model, tokenizer, dataset_name="pg19", press=press_stream)
+        
+    #     results['StreamingLLM (BS=1)'] = {'speed': speed_stream_bs1, 'ppl_wiki': ppl_stream_wiki, 'ppl_pg19': ppl_stream_pg19}
+    #     results['StreamingLLM (BS=4)'] = {'speed': speed_stream_bs4, 'ppl_wiki': None, 'ppl_pg19': None}
+    # except Exception as e:
+    #     logger.error(f"StreamingLLM Failed: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+
+    # # 4. PyramidKVPress (Compression 0.5)
+    # print("\n=== PyramidKVPress (ratio=0.5) ===")
+    # try:
+    #     press_pyramid = PyramidKVPress(compression_ratio=0.1)
+    #     speed_pyramid_bs1 = benchmark_speed(model, tokenizer, press=press_pyramid, num_tokens=30, batch_size=1)
+    #     speed_pyramid_bs4 = benchmark_speed(model, tokenizer, press=press_pyramid, num_tokens=30, batch_size=4)
+    #     ppl_pyramid_wiki = evaluate_ppl(model, tokenizer, dataset_name="wikitext", limit_samples=20, press=press_pyramid)
+    #     ppl_pyramid_pg19 = evaluate_ppl(model, tokenizer, dataset_name="pg19", press=press_pyramid)
+        
+    #     results['PyramidKV (BS=1)'] = {'speed': speed_pyramid_bs1, 'ppl_wiki': ppl_pyramid_wiki, 'ppl_pg19': ppl_pyramid_pg19}
+    #     results['PyramidKV (BS=4)'] = {'speed': speed_pyramid_bs4, 'ppl_wiki': None, 'ppl_pg19': None}
+    # except Exception as e:
+    #     logger.error(f"PyramidKV Failed: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+
+    # print("\n" + "="*60)
+    # print(f"{'Method':<20} | {'Speed (tok/s)':<15} | {'PPL (Wiki)':<12} | {'PPL (PG19)':<12}")
+    # print("-" * 70)
+    # for method, res in results.items():
+    #     ppl_wiki = f"{res.get('ppl_wiki'):.2f}" if res.get('ppl_wiki') is not None else "N/A"
+    #     ppl_pg19 = f"{res.get('ppl_pg19'):.2f}" if res.get('ppl_pg19') is not None else "N/A"
+    #     print(f"{method:<20} | {res['speed']:<15.2f} | {ppl_wiki:<12} | {ppl_pg19:<12}")
+    # print("="*60)
