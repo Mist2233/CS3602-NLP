@@ -3,7 +3,8 @@ import time
 import torch
 import copy
 from tqdm import tqdm
-from calflops import calculate_flops
+
+# from calflops import calculate_flops  # 暂时注释掉，加快测试
 
 # 1. 设置镜像
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -17,11 +18,13 @@ from datasets import load_dataset
 from pythia_press import PythiaStreamingLLMPress
 
 # ================= 配置区域 =================
-MODEL_PATH = "./models/pythia-2.8b"  
+MODEL_PATH = "./models/pythia-2.8b"
 # MODEL_PATH = "EleutherAI/pythia-70m" # 如果本地没有，可以用这个在线拉取
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LENGTH = 2048
-COMPRESSION_RATIO = 0.7  # 改为更激进的压缩率，保留 30% 的 KV Cache
+COMPRESSION_RATIO = 0.7  # 压缩率：丢弃 70% 的中间 tokens
+N_SINK = 4  # Attention Sink 数量
+MAX_CAPACITY = None  # KV Cache 最大容量，None 表示自动计算（512 * 0.3 = 154 tokens）
 # ===========================================
 
 print(f"检测到的设备: {DEVICE}")
@@ -35,6 +38,11 @@ model.eval()
 
 # -------- 准备数据 --------
 print("准备测试数据...")
+# 设置为离线模式，使用本地缓存
+import datasets
+
+datasets.config.HF_DATASETS_OFFLINE = True
+
 # 1. WikiText
 wiki_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
 wiki_text = "\n\n".join(wiki_data["text"])
@@ -66,30 +74,79 @@ class SpeedTestStreamer(TextStreamer):
 
 
 # -------- 核心测试逻辑封装 --------
-def calculate_ppl(text, stride=512):
+def calculate_ppl(text, stride=512, use_kv_cache=False):
+    """
+    计算困惑度 (PPL)
+
+    Args:
+        text: 输入文本
+        stride: 滑动窗口步长
+        use_kv_cache: 是否使用 KV Cache（用于测试 StreamingLLM 的真实影响）
+    """
     encodings = tokenizer(text, return_tensors="pt")
     seq_len = encodings.input_ids.size(1)
     nlls = []
     prev_end_loc = 0
 
     # 限制一下最大测试长度，避免太慢
-    max_test_len = min(seq_len, 4096)
+    # 使用 KV Cache 模式时大幅减少长度（逐 token 计算很慢）
+    if use_kv_cache:
+        max_test_len = min(seq_len, 512)  # KV Cache 模式：只测试 512 tokens
+    else:
+        max_test_len = min(seq_len, 4096)  # 快速模式：测试 4096 tokens
 
-    for begin_loc in range(0, max_test_len, stride):
-        end_loc = min(begin_loc + MAX_LENGTH, seq_len)
-        trg_len = end_loc - prev_end_loc
-        input_ids = encodings.input_ids[:, begin_loc:end_loc].to(DEVICE)
-        target_ids = input_ids.clone()
-        target_ids[:, :-trg_len] = -100
+    if not use_kv_cache:
+        # 原始方法：不使用 KV Cache（快速但不反映压缩影响）
+        for begin_loc in range(0, max_test_len, stride):
+            end_loc = min(begin_loc + MAX_LENGTH, seq_len)
+            trg_len = end_loc - prev_end_loc
+            input_ids = encodings.input_ids[:, begin_loc:end_loc].to(DEVICE)
+            target_ids = input_ids.clone()
+            target_ids[:, :-trg_len] = -100
 
-        with torch.no_grad():
-            outputs = model(input_ids, labels=target_ids)
-            neg_log_likelihood = outputs.loss * trg_len
+            with torch.no_grad():
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss * trg_len
 
-        nlls.append(neg_log_likelihood)
-        prev_end_loc = end_loc
-        if end_loc == max_test_len:
-            break
+            nlls.append(neg_log_likelihood)
+            prev_end_loc = end_loc
+            if end_loc == max_test_len:
+                break
+    else:
+        # 新方法：生成式 PPL 计算（逐 token，累积 past_key_values）
+        # 这样 StreamingLLM 的压缩会真正影响后续预测
+        print(f"   (生成式计算 {max_test_len} tokens，预计需要 1-2 分钟...)")
+
+        input_ids = encodings.input_ids[:, :max_test_len].to(DEVICE)
+        past_key_values = None
+
+        # 逐 token 预测：用 token[0:i] 预测 token[i]
+        for i in tqdm(
+            range(1, input_ids.size(1)), desc="   计算 PPL", ncols=80, leave=False
+        ):
+            with torch.no_grad():
+                # 输入当前 token[i-1]（配合之前的 past_kv）
+                current_input = input_ids[:, i - 1 : i]
+
+                outputs = model(
+                    current_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+
+                # 预测 token[i]
+                logits = outputs.logits[:, -1, :]  # [batch, vocab_size]
+                target = input_ids[:, i]  # [batch]
+
+                # 计算 loss
+                loss = torch.nn.functional.cross_entropy(logits, target)
+                nlls.append(loss)
+
+                # 更新 past_key_values（会被 StreamingLLM 压缩！）
+                past_key_values = outputs.past_key_values
+
+        prev_end_loc = input_ids.size(1) - 1
 
     if not nlls:
         return 0.0
@@ -137,12 +194,15 @@ def test_speed(input_text, generate_len=100):
 
 
 # -------- 统一运行函数 --------
-def run_benchmark_suite(suite_name):
+def run_benchmark_suite(suite_name, use_kv_cache_for_ppl=False):
     print(f"\n{'#'*20} 开始测试: {suite_name} {'#'*20}")
 
     # 1. 测试 PPL
-    print(">>> 计算 WikiText PPL...")
-    ppl = calculate_ppl(wiki_text)
+    if use_kv_cache_for_ppl:
+        print(">>> 计算 WikiText PPL (使用 KV Cache，反映压缩影响)...")
+    else:
+        print(">>> 计算 WikiText PPL (快速模式)...")
+    ppl = calculate_ppl(wiki_text, use_kv_cache=use_kv_cache_for_ppl)
     print(f"[{suite_name}] WikiText PPL: {ppl:.2f}")
 
     # 2. 测试速度与显存
@@ -166,17 +226,21 @@ results = {}
 
 # 1. 运行 Baseline (无压缩)
 print("\n正在运行 Baseline...")
-results["Baseline"] = run_benchmark_suite("Baseline")
+results["Baseline"] = run_benchmark_suite("Baseline", use_kv_cache_for_ppl=True)
 
 # 2. 运行 StreamingLLM
 print(f"\n正在运行 StreamingLLM (压缩率 {COMPRESSION_RATIO})...")
 # 初始化自定义的 PythiaStreamingLLMPress
-press = PythiaStreamingLLMPress(compression_ratio=COMPRESSION_RATIO, n_sink=4)
+press = PythiaStreamingLLMPress(
+    compression_ratio=COMPRESSION_RATIO, n_sink=N_SINK, max_capacity=MAX_CAPACITY
+)
 
 # 使用 context manager: with press(model):
 # 在这个块内，模型所有的 forward 都会自动应用 StreamingLLM 策略
 with press(model):
-    results["StreamingLLM"] = run_benchmark_suite("StreamingLLM")
+    results["StreamingLLM"] = run_benchmark_suite(
+        "StreamingLLM", use_kv_cache_for_ppl=True
+    )
 
 # ================= 最终对比报表 =================
 print("\n" + "=" * 40)

@@ -13,24 +13,36 @@ class PythiaStreamingLLMPress:
     - 必须使用 register_forward_pre_hook(with_kwargs=True)
     """
 
-    def __init__(self, compression_ratio: float = 0.0, n_sink: int = 4):
+    def __init__(
+        self, compression_ratio: float = 0.0, n_sink: int = 4, max_capacity: int = None
+    ):
         """
         Args:
-            compression_ratio: 压缩率 (0.0-1.0)，例如 0.7 表示丢弃 70% 的中间 tokens
+            compression_ratio: 压缩率 (0.0-1.0)，例如 0.7 表示压缩掉 70% 的中间 tokens
             n_sink: Attention Sinks，保留开头多少个 token 不被压缩
+            max_capacity: KV Cache 的最大容量（总token数）。如果为 None，会根据压缩率自动计算
         """
         self.compression_ratio = compression_ratio
         self.n_sink = n_sink
         self.hooks = []
         self.compression_count = 0
 
-        # 计算 max_capacity: 保留 sink + window 的总长度
-        # 当压缩率是 0.7 时，保留 30% 的 tokens
-        # 例如: n_sink=4, ratio=0.7 → 保留 30% → 假设原始 100 → 保留 30
-        # 简化: 使用固定窗口 max_capacity
-        # 这里为了兼容之前的 debug_press.py 逻辑，我们使用一个合理的默认值
-        # 实际上压缩率应该动态计算，但为了简单我们先固定 max_capacity
-        self.max_capacity = max(self.n_sink + 10, int(50 * (1 - compression_ratio)))
+        # 计算 max_capacity
+        # StreamingLLM 的正确理解：
+        # - compression_ratio=0.7 表示"压缩掉中间70%的tokens"
+        # - 但整体保留的tokens应该足够多，以维持合理的上下文
+        # - 论文中通常保留几百个tokens (例如 256, 512)
+        if max_capacity is not None:
+            self.max_capacity = max_capacity
+        else:
+            # 默认策略：根据压缩率计算，但确保至少保留一个合理的窗口
+            # 基准窗口：512 tokens
+            # compression_ratio=0.7 → 保留 30% → 154 tokens
+            # compression_ratio=0.5 → 保留 50% → 256 tokens
+            base_window = 512
+            self.max_capacity = max(
+                self.n_sink + 50, int(base_window * (1 - compression_ratio))
+            )
 
     def _make_hook(self, layer_idx):
         """为每个层创建专属的 hook"""
@@ -84,6 +96,30 @@ class PythiaStreamingLLMPress:
 
         k_new = torch.cat([k_sink, k_window], dim=2)
         v_new = torch.cat([v_sink, v_window], dim=2)
+
+        # 调试：验证 Attention Sink 是否被正确保留
+        if self.compression_count == 1:  # 只在第一次压缩时打印
+            expected_len = self.max_capacity
+            actual_len = k_new.shape[2]
+            print(f"\n[COMPRESS DEBUG] Layer {layer_idx}")
+            print(
+                f"  Seq Len: {seq_len} -> Expected: {expected_len}, Actual: {actual_len}"
+            )
+            print(f"  n_sink={self.n_sink}, window_size={window_size}")
+
+            # 验证 Attention Sinks 是否被保留
+            are_sinks_preserved = torch.allclose(
+                key[:, :, : self.n_sink, :],
+                k_new[:, :, : self.n_sink, :],
+                rtol=1e-5,
+                atol=1e-8,
+            )
+            print(f"  Attention Sinks Preserved: {are_sinks_preserved}")
+
+            if not are_sinks_preserved:
+                raise ValueError(
+                    "FATAL: Attention Sinks were NOT preserved during compression!"
+                )
 
         # 使用正确的方式修改 DynamicCache
         try:
