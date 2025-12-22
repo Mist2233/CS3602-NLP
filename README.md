@@ -33,7 +33,17 @@ python main.py test
 - **实时日志**：每 100 步或发生驱逐 (Eviction) 时，打印当前 KV Cache 的形状。
 - **验证点**：你可以清晰地看到 Cache 大小在达到 `Limit + Buffer` 后被压缩回 `Limit`，证明 Sink 机制和滑动窗口正在工作。
 
-## 📜 早期探索：非侵入式实现 (test.ipynb)
+## � 项目文件结构
+
+| 文件名 | 说明 |
+| :--- | :--- |
+| **`main.py`** | **项目主入口**。包含了标准评估 (`run_standard_benchmark`) 和调试模式 (`debug_test_mechanics`) 的完整逻辑。负责加载模型、数据集，并调度评估任务。 |
+| **`pythia_streaming_patch.py`** | **核心逻辑实现**。包含 `StreamingDynamicCache` 类（实现 Sink+Window 驱逐策略）和 Monkey-Patching 逻辑（注入模型 Forward 函数）。同时包含用于验证 O(1) 复杂度的 Attention 独立计时器。 |
+| **`test.ipynb` / `test.py`** | **早期探索代码**。基于非侵入式方案（手动压缩 Cache）的验证脚本。仅作为参考，用于对比 Monkey-Patching 方案的优越性。 |
+| **`utils.py`** | **辅助工具库**。为 `test.py` 提供非侵入式 `StreamingLLM` 类的实现及加载模型的辅助函数。 |
+| **`text/`** | **测试数据目录**。包含用于本地调试的长文本文件 (e.g., `long_normal.txt`)。 |
+
+## �📜 早期探索：非侵入式实现 (test.ipynb)
 
 在最终采用 Monkey-Patching 方案之前，我们首先在 `test.ipynb`/`test.py + utils.py` 中尝试了一种**非侵入式**的实现方案。
 
