@@ -33,7 +33,7 @@ python main.py test
 - **实时日志**：每 100 步或发生驱逐 (Eviction) 时，打印当前 KV Cache 的形状。
 - **验证点**：你可以清晰地看到 Cache 大小在达到 `Limit + Buffer` 后被压缩回 `Limit`，证明 Sink 机制和滑动窗口正在工作。
 
-## � 项目文件结构
+##  项目文件结构
 
 | 文件名 | 说明 |
 | :--- | :--- |
@@ -43,7 +43,7 @@ python main.py test
 | **`utils.py`** | **辅助工具库**。为 `test.py` 提供非侵入式 `StreamingLLM` 类的实现及加载模型的辅助函数。 |
 | **`text/`** | **测试数据目录**。包含用于本地调试的长文本文件 (e.g., `long_normal.txt`)。 |
 
-## �📜 早期探索：非侵入式实现 (test.ipynb)
+## 早期探索：非侵入式实现 (test.ipynb)
 
 在最终采用 Monkey-Patching 方案之前，我们首先在 `test.ipynb`/`test.py + utils.py` 中尝试了一种**非侵入式**的实现方案。
 
@@ -56,7 +56,7 @@ python main.py test
 
 ---
 
-## 💡 实现原理与优化
+##  实现原理与优化
 
 ### 1. 核心算法：Sink + Sliding Window
 StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“注意力锚点”，同时仅保留最近的窗口 (Window)。
@@ -114,7 +114,7 @@ StreamingLLM 的核心在于保留序列开头的初始 Tokens (Sink) 作为“�
 
 ---
 
-## 📊 实验结果分析
+## 实验结果分析
 
 以下结果基于 **Pythia-2.8B** 在 **RTX 4060 Ti (16GB)** 上的实测数据。
 
