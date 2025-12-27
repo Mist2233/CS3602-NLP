@@ -1,13 +1,16 @@
+import os
 import torch
 import time
 import math
 import gc
 import sys
 from datasets import load_dataset
+import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from pythia_streaming_patch import (
+from pythia_streaming_h2o_patch import (
     enable_streaming_llm,
     disable_streaming_llm,
+    enable_h2o_llm,
     reset_attention_timing,
     enable_attention_timing_collection,
     disable_attention_timing_collection,
@@ -16,29 +19,48 @@ from pythia_streaming_patch import (
     get_raw_attention_times,
 )
 
+# HuggingFace 配置（可选：设置镜像加速）
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 configs = [
     {"name": "baseline", "type": "baseline"},
     {"name": "streaming_8_256", "type": "streaming", "sink": 8, "window": 256},
     {"name": "streaming_8_512", "type": "streaming", "sink": 8, "window": 512},
+    # H2O 配置：max_capacity=256, 其中 4 个 Sink + 32 个 Recent + 220 个 Heavy Hitters
+    {"name": "h2o_4_32_256", "type": "h2o", "sink": 4, "recent": 32, "capacity": 256},
+    {"name": "h2o_8_32_256", "type": "h2o", "sink": 8, "recent": 32, "capacity": 256},
+    # 更大容量的 H2O 配置
+    {"name": "h2o_8_64_512", "type": "h2o", "sink": 8, "recent": 64, "capacity": 512},
 ]
+# 使用 HuggingFace 模型
 model_id = "EleutherAI/pythia-2.8b"
 device = "cuda"
 ppl_tokens = 1000
-speed_tokens = 500
+speed_tokens = 1000
 Pre_tokens = 500
 
 
 def load_long_text(dataset_name="wikitext", split="test", limit_chars=50000):
-    """加载wiki/pg19文本用于测试"""
+    """从 HuggingFace 加载数据集"""
     print(f"正在加载 {dataset_name}...")
     try:
         if dataset_name == "wikitext":
+            # 从 HuggingFace 加载 wikitext-2-raw-v1
             ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
             text = "\n\n".join(ds["text"])
+            print(f"  -> 成功加载 {len(ds)} 条记录")
+
         elif dataset_name == "pg19":
-            ds = load_dataset("pg19", split=split, streaming=True)
-            sample = next(iter(ds))
-            text = sample["text"]
+            # 从 HuggingFace 加载 PG-19
+            ds = load_dataset("deepmind/pg19", split=split, streaming=True)
+            # 取前几个样本拼接
+            texts = []
+            for i, example in enumerate(ds):
+                texts.append(example["text"])
+                if i >= 2:  # 取前3个样本
+                    break
+            text = "\n\n".join(texts)
+            print(f"  -> 成功加载 PG-19 样本")
         else:
             text = "Long text placeholder. " * 1000
     except Exception as e:
@@ -222,9 +244,7 @@ def run_standard_benchmark():
     # 加载数据
     wiki_text = load_long_text("wikitext", limit_chars=50000)
     pg19_text = load_long_text("pg19", limit_chars=50000)
-    import pdb
 
-    pdb.set_trace()
     results = []
 
     for config in configs:
@@ -234,16 +254,28 @@ def run_standard_benchmark():
         if config["type"] == "baseline":
             disable_streaming_llm(model)  # 确保移除之前的 patch
             patch_attention_layers(model)  # 仅 patch 计时器
-        else:
+        elif config["type"] == "streaming":
             enable_streaming_llm(
                 model, n_sink=config["sink"], window_size=config["window"], debug=False
+            )
+        elif config["type"] == "h2o":
+            enable_h2o_llm(
+                model,
+                n_sink=config["sink"],
+                recent_window=config["recent"],
+                max_capacity=config["capacity"],
+                debug=False,
             )
 
         torch.cuda.empty_cache()
         gc.collect()
 
         # 2. PPL 测试
-        chunk_size = config.get("window", 1024)  # Baseline 默认 chunk 1024
+        # 对于 H2O，使用 capacity 作为 chunk_size
+        if config["type"] == "h2o":
+            chunk_size = config.get("capacity", 256)
+        else:
+            chunk_size = config.get("window", 1024)  # Baseline 默认 chunk 1024
         wiki_ppl = evaluate_ppl_unified(
             model, tokenizer, wiki_text, max_tokens=ppl_tokens, chunk_size=chunk_size
         )
@@ -287,7 +319,8 @@ def debug_test_mechanics():
     print("=" * 60)
     print("   [Mode] StreamingLLM (Sink=8, Window=256)")
 
-    model_id = "EleutherAI/pythia-160m"
+    # 使用 HuggingFace 模型
+    model_id = "EleutherAI/pythia-2.8b"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype=torch.float16, device_map="cuda"
